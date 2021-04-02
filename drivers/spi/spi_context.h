@@ -47,6 +47,8 @@ struct spi_context {
 
 #ifdef CONFIG_SPI_SLAVE
 	int recv_frames;
+	bool wating_for_tfr_start;
+	bool first_tx_frame;
 #endif /* CONFIG_SPI_SLAVE */
 };
 
@@ -132,6 +134,10 @@ static inline void spi_context_complete(struct spi_context *ctx, int status)
 				 * about number of received frames.
 				 */
 				status = ctx->recv_frames;
+				if((ctx->tx_len != 0) && (ctx->tx_len != 0))
+					LOG_INF("SPI transfer terminated unexpectedly after %d frames", status);
+				if(ctx->wating_for_tfr_start)
+					LOG_ERR("SPI internal error. Waiting for transfer to start but stopped unexpectedly.")
 			}
 #endif /* CONFIG_SPI_SLAVE */
 			k_poll_signal_raise(ctx->signal, status);
@@ -168,11 +174,17 @@ static inline int spi_context_cs_inactive_value(struct spi_context *ctx)
 static inline void spi_context_cs_configure(struct spi_context *ctx)
 {
 	if (ctx->config->cs && ctx->config->cs->gpio_dev) {
-		gpio_pin_configure(ctx->config->cs->gpio_dev,
-				   ctx->config->cs->gpio_pin, GPIO_DIR_OUT);
-		gpio_pin_write(ctx->config->cs->gpio_dev,
-			       ctx->config->cs->gpio_pin,
-			       spi_context_cs_inactive_value(ctx));
+		if(ctx->config->operation & SPI_OP_MODE_SLAVE) {
+			gpio_pin_configure(ctx->config->cs->gpio_dev,
+					ctx->config->cs->gpio_pin, GPIO_DIR_IN);
+		}
+		else {
+			gpio_pin_configure(ctx->config->cs->gpio_dev,
+					ctx->config->cs->gpio_pin, GPIO_DIR_OUT);
+			gpio_pin_write(ctx->config->cs->gpio_dev,
+					ctx->config->cs->gpio_pin,
+					spi_context_cs_inactive_value(ctx));
+		}
 	} else {
 		LOG_INF("CS control inhibited (no GPIO device)");
 	}
@@ -181,6 +193,12 @@ static inline void spi_context_cs_configure(struct spi_context *ctx)
 static inline void _spi_context_cs_control(struct spi_context *ctx,
 					   bool on, bool force_off)
 {
+#ifdef CONFIG_SPI_SLAVE
+	if (spi_context_is_slave(ctx)) {
+		return;
+	}
+#endif /* CONFIG_SPI_SLAVE */
+
 	if (ctx->config && ctx->config->cs && ctx->config->cs->gpio_dev) {
 		if (on) {
 			gpio_pin_write(ctx->config->cs->gpio_dev,
@@ -203,7 +221,7 @@ static inline void _spi_context_cs_control(struct spi_context *ctx,
 
 static inline void spi_context_cs_control(struct spi_context *ctx, bool on)
 {
-	_spi_context_cs_control(ctx, on, false);
+	return _spi_context_cs_control(ctx, on, false);
 }
 
 static inline void spi_context_unlock_unconditionally(struct spi_context *ctx)
@@ -252,6 +270,8 @@ void spi_context_buffers_setup(struct spi_context *ctx,
 
 #ifdef CONFIG_SPI_SLAVE
 	ctx->recv_frames = 0;
+	ctx->first_tx_frame = true;
+	ctx->wating_for_tfr_start = spi_context_is_slave(ctx); // wait true if slave
 #endif /* CONFIG_SPI_SLAVE */
 
 	LOG_DBG("current_tx %p (%zu), current_rx %p (%zu),"
@@ -264,6 +284,17 @@ void spi_context_buffers_setup(struct spi_context *ctx,
 static ALWAYS_INLINE
 void spi_context_update_tx(struct spi_context *ctx, u8_t dfs, u32_t len)
 {
+#ifdef CONFIG_SPI_SLAVE
+	if (spi_context_is_slave(ctx)) {
+		if(ctx->first_tx_frame)	{
+			ctx->first_tx_frame = false;
+		}
+		else {
+			ctx->wating_for_tfr_start = false;
+		}
+	}
+#endif /* CONFIG_SPI_SLAVE */
+
 	if (!ctx->tx_len) {
 		return;
 	}
@@ -293,7 +324,25 @@ void spi_context_update_tx(struct spi_context *ctx, u8_t dfs, u32_t len)
 static ALWAYS_INLINE
 bool spi_context_tx_on(struct spi_context *ctx)
 {
-	return !!(ctx->tx_len);
+	bool ret = true;
+#ifdef CONFIG_SPI_SLAVE
+	int state = 0;
+
+	if(ctx->wating_for_tfr_start)
+		return true;
+
+	if (ctx->config && ctx->config->cs && ctx->config->cs->gpio_dev) {
+		if(spi_context_is_slave(ctx)) {
+			gpio_pin_read(ctx->config->cs->gpio_dev,
+				ctx->config->cs->gpio_pin, 
+				&state);
+		}
+	}
+
+	ret = (state == spi_context_cs_active_value(ctx));
+#endif
+
+	return !!(ctx->tx_len) && ret;
 }
 
 static ALWAYS_INLINE
@@ -308,6 +357,7 @@ void spi_context_update_rx(struct spi_context *ctx, u8_t dfs, u32_t len)
 #ifdef CONFIG_SPI_SLAVE
 	if (spi_context_is_slave(ctx)) {
 		ctx->recv_frames += len;
+		ctx->wating_for_tfr_start = false;
 	}
 
 #endif /* CONFIG_SPI_SLAVE */
@@ -341,7 +391,26 @@ void spi_context_update_rx(struct spi_context *ctx, u8_t dfs, u32_t len)
 static ALWAYS_INLINE
 bool spi_context_rx_on(struct spi_context *ctx)
 {
-	return !!(ctx->rx_len);
+	bool ret = true;
+#ifdef CONFIG_SPI_SLAVE
+	int state = 0;
+	
+	if(ctx->wating_for_tfr_start)
+		return true;
+
+	if (ctx->config && ctx->config->cs && ctx->config->cs->gpio_dev) {
+		if(spi_context_is_slave(ctx)) {
+			gpio_pin_read(ctx->config->cs->gpio_dev,
+				ctx->config->cs->gpio_pin, 
+				&state);
+		}
+	}
+
+	ret = (state == spi_context_cs_active_value(ctx));
+#endif
+
+
+	return !!(ctx->rx_len) && ret;
 }
 
 static ALWAYS_INLINE
