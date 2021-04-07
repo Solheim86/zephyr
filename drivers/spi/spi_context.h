@@ -134,10 +134,6 @@ static inline void spi_context_complete(struct spi_context *ctx, int status)
 				 * about number of received frames.
 				 */
 				status = ctx->recv_frames;
-				if((ctx->tx_len != 0) && (ctx->tx_len != 0))
-					LOG_INF("SPI transfer terminated unexpectedly after %d frames", status);
-				if(ctx->wating_for_tfr_start)
-					LOG_ERR("SPI internal error. Waiting for transfer to start but stopped unexpectedly.")
 			}
 #endif /* CONFIG_SPI_SLAVE */
 			k_poll_signal_raise(ctx->signal, status);
@@ -221,7 +217,7 @@ static inline void _spi_context_cs_control(struct spi_context *ctx,
 
 static inline void spi_context_cs_control(struct spi_context *ctx, bool on)
 {
-	return _spi_context_cs_control(ctx, on, false);
+	_spi_context_cs_control(ctx, on, false);
 }
 
 static inline void spi_context_unlock_unconditionally(struct spi_context *ctx)

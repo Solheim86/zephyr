@@ -173,7 +173,6 @@ static void spi_stm32_shift_s(SPI_TypeDef *spi, struct spi_stm32_data *data)
 	}
 }
 
-
 /*
  * Without a FIFO, we can only shift out one frame's worth of SPI
  * data, and read the response back.
@@ -193,7 +192,7 @@ static int spi_stm32_shift_frames(SPI_TypeDef *spi, struct spi_stm32_data *data)
 	return spi_stm32_get_err(spi);
 }
 
-/* Init a SPI frame. */
+/* Init an SPI frame as slave. */
 static void spi_stm32_init_frame(SPI_TypeDef *spi, struct spi_stm32_data *data)
 {
 	if(!spi_context_is_slave(&data->ctx)) {
@@ -362,10 +361,8 @@ static int spi_stm32_configure(struct device *dev,
 	LL_SPI_DisableCRC(spi);
 
 	if (config->cs || !IS_ENABLED(CONFIG_SPI_STM32_USE_HW_SS)) {
-		LOG_INF("SPI using software SS");
 		LL_SPI_SetNSSMode(spi, LL_SPI_NSS_SOFT);
 	} else {
-		LOG_INF("SPI using hardware SS");
 		if (config->operation & SPI_OP_MODE_SLAVE) {
 			LL_SPI_SetNSSMode(spi, LL_SPI_NSS_HARD_INPUT);
 		} else {
@@ -375,10 +372,8 @@ static int spi_stm32_configure(struct device *dev,
 
 	if (config->operation & SPI_OP_MODE_SLAVE) {
 		LL_SPI_SetMode(spi, LL_SPI_MODE_SLAVE);
-		LOG_INF("SPI set as slave");
 	} else {
 		LL_SPI_SetMode(spi, LL_SPI_MODE_MASTER);
-		LOG_INF("SPI set as master");
 	}
 
 	if (SPI_WORD_SIZE_GET(config->operation) ==  8) {
@@ -401,12 +396,16 @@ static int spi_stm32_configure(struct device *dev,
 	spi_context_cs_configure(&data->ctx);
 
 	LOG_DBG("Installed config %p: freq %uHz (div = %u),"
-		    " mode %u/%u/%u, slave %u",
+		    " mode %u/%u/%u, slave %u, software SS %u",
 		    config, clock >> br, 1 << br,
 		    (SPI_MODE_GET(config->operation) & SPI_MODE_CPOL) ? 1 : 0,
 		    (SPI_MODE_GET(config->operation) & SPI_MODE_CPHA) ? 1 : 0,
 		    (SPI_MODE_GET(config->operation) & SPI_MODE_LOOP) ? 1 : 0,
-		    config->slave);
+		    config->slave,
+			(config->cs || !IS_ENABLED(CONFIG_SPI_STM32_USE_HW_SS)));
+#ifdef CONFIG_SPI_SLAVE
+	LOG_DBG("SPI using slave mode Zephyr patch.");
+#endif /* ifdef CONFIG_SPI_SLAVE */
 
 	return 0;
 }
@@ -463,7 +462,9 @@ static int transceive(struct device *dev,
 
 	/* This is turned off in spi_stm32_complete(). */
 	spi_context_cs_control(&data->ctx, true);
+#ifdef CONFIG_SPI_SLAVE
 	spi_stm32_init_frame(spi, data);
+#endif /* #ifdef CONFIG_SPI_SLAVE */
 
 #ifdef CONFIG_SPI_STM32_INTERRUPT
 	ll_func_enable_int_errors(spi);
@@ -475,20 +476,16 @@ static int transceive(struct device *dev,
 	ll_func_enable_int_tx_empty(spi);
 
 #ifdef CONFIG_SPI_SLAVE
-	int sem_ret;
-	
 	if(spi_context_is_slave(&data->ctx)) {
 		/* poll SS line to see if tfr is done
 		// TODO: adjust to use SS edge detection */
 		do {
-			sem_ret = k_sem_take(&data->ctx.sync, 5);
-		} while ((sem_ret != 0) && spi_stm32_transfer_ongoing(data));
-		
+			ret = k_sem_take(&data->ctx.sync, 5);
+		} while ((ret != 0) && spi_stm32_transfer_ongoing(data));
+		k_sem_reset(&data->ctx.sync);
+
 		/* update return value */
-		ret = data->ctx.sync_status;
-		if(!ret) {
-			ret = data->ctx.recv_frames;
-		}
+		ret = data->ctx.recv_frames;
 	}
 	else 
 		ret = spi_context_wait_for_completion(&data->ctx);
@@ -499,7 +496,9 @@ static int transceive(struct device *dev,
 #else /* ifdef CONFIG_SPI_STM32_INTERRUPT */
 	do {
 		ret = spi_stm32_shift_frames(spi, data);
-	} while (!ret && spi_stm32_transfer_ongoing(data));
+	} while ((ret != 0) && spi_stm32_transfer_ongoing(data));
+
+	spi_stm32_complete(data, spi, ret);
 
 #ifdef CONFIG_SPI_SLAVE
 	if (spi_context_is_slave(&data->ctx) && !ret) {
