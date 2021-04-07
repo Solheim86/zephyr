@@ -49,6 +49,8 @@ struct spi_context {
 	int recv_frames;
 	bool wating_for_tfr_start;
 	bool first_tx_frame;
+
+	struct gpio_callback ss_inactive_isr;
 #endif /* CONFIG_SPI_SLAVE */
 };
 
@@ -83,6 +85,10 @@ static inline void spi_context_lock(struct spi_context *ctx,
 
 static inline void spi_context_release(struct spi_context *ctx, int status)
 {
+	/* ensure sync sem is reset to a known state */
+	k_sem_give(&ctx->sync);
+	k_sem_reset(&ctx->sync);
+
 #ifdef CONFIG_SPI_SLAVE
 	if (status >= 0 && (ctx->config->operation & SPI_LOCK_ON)) {
 		return;
@@ -167,20 +173,62 @@ static inline int spi_context_cs_inactive_value(struct spi_context *ctx)
 	return 1;
 }
 
+#ifdef CONFIG_SPI_SLAVE
+/* function is run when SS (AKA CS) transistions from an active to inactive state */
+static void spi_context_cs_isr(struct device *gpio, struct gpio_callback *cb, u32_t pins)
+{
+	struct spi_context *ctx = CONTAINER_OF(cb, struct spi_context, ss_inactive_isr);
+
+	if(ctx == NULL) {
+		return;
+	}
+
+	if(ctx->wating_for_tfr_start){
+		return;
+	}
+	
+	spi_context_complete(ctx, 0);
+}
+#endif /* #ifdef CONFIG_SPI_SLAVE */
+
 static inline void spi_context_cs_configure(struct spi_context *ctx)
 {
 	if (ctx->config->cs && ctx->config->cs->gpio_dev) {
+#ifdef CONFIG_SPI_SLAVE
+		/* If SPI is in slave mode:
+		   configure CS pin as input and setup spi_context_cs_isr() to be
+		   run when CS pin transitions from active to inactive. */ 
 		if(ctx->config->operation & SPI_OP_MODE_SLAVE) {
-			gpio_pin_configure(ctx->config->cs->gpio_dev,
-					ctx->config->cs->gpio_pin, GPIO_DIR_IN);
+			if(spi_context_cs_active_value(ctx) > 0) {
+				gpio_pin_configure(ctx->config->cs->gpio_dev,
+						ctx->config->cs->gpio_pin, 
+						(GPIO_DIR_IN |
+						GPIO_INT_ACTIVE_LOW |
+						GPIO_INT | GPIO_INT_EDGE |
+						GPIO_PUD_PULL_DOWN));
+			}
+			else {
+				gpio_pin_configure(ctx->config->cs->gpio_dev,
+						ctx->config->cs->gpio_pin, 
+						(GPIO_DIR_IN |
+						GPIO_INT_ACTIVE_HIGH |
+						GPIO_INT | GPIO_INT_EDGE |
+						GPIO_PUD_PULL_UP));
+			}
+
+			gpio_init_callback(&ctx->ss_inactive_isr, spi_context_cs_isr, BIT(ctx->config->cs->gpio_pin));
+			gpio_add_callback(ctx->config->cs->gpio_dev, &ctx->ss_inactive_isr);
 		}
 		else {
+#endif /* #ifdef CONFIG_SPI_SLAVE */
 			gpio_pin_configure(ctx->config->cs->gpio_dev,
 					ctx->config->cs->gpio_pin, GPIO_DIR_OUT);
 			gpio_pin_write(ctx->config->cs->gpio_dev,
 					ctx->config->cs->gpio_pin,
 					spi_context_cs_inactive_value(ctx));
+#ifdef CONFIG_SPI_SLAVE
 		}
+#endif /* #ifdef CONFIG_SPI_SLAVE */
 	} else {
 		LOG_INF("CS control inhibited (no GPIO device)");
 	}
@@ -189,29 +237,40 @@ static inline void spi_context_cs_configure(struct spi_context *ctx)
 static inline void _spi_context_cs_control(struct spi_context *ctx,
 					   bool on, bool force_off)
 {
+	if (!(ctx->config && ctx->config->cs && ctx->config->cs->gpio_dev))
+		return;
+
 #ifdef CONFIG_SPI_SLAVE
+    /* Enable spi_context_cs_isr() to be run when SPI driver is set to transfer data.
+	   This will allow for detection of an early termination of the transfer by the master. */
 	if (spi_context_is_slave(ctx)) {
+		if(on) {
+			gpio_pin_enable_callback(ctx->config->cs->gpio_dev, ctx->config->cs->gpio_pin);
+		}
+		else {			
+			gpio_pin_disable_callback(ctx->config->cs->gpio_dev, ctx->config->cs->gpio_pin);
+		}
+
 		return;
 	}
 #endif /* CONFIG_SPI_SLAVE */
 
-	if (ctx->config && ctx->config->cs && ctx->config->cs->gpio_dev) {
-		if (on) {
-			gpio_pin_write(ctx->config->cs->gpio_dev,
-				       ctx->config->cs->gpio_pin,
-				       spi_context_cs_active_value(ctx));
-			k_busy_wait(ctx->config->cs->delay);
-		} else {
-			if (!force_off &&
-			    ctx->config->operation & SPI_HOLD_ON_CS) {
-				return;
-			}
-
-			k_busy_wait(ctx->config->cs->delay);
-			gpio_pin_write(ctx->config->cs->gpio_dev,
-				       ctx->config->cs->gpio_pin,
-				       spi_context_cs_inactive_value(ctx));
+	/* else context is master */
+	if (on) {
+		gpio_pin_write(ctx->config->cs->gpio_dev,
+					ctx->config->cs->gpio_pin,
+					spi_context_cs_active_value(ctx));
+		k_busy_wait(ctx->config->cs->delay);
+	} else {
+		if (!force_off &&
+			ctx->config->operation & SPI_HOLD_ON_CS) {
+			return;
 		}
+
+		k_busy_wait(ctx->config->cs->delay);
+		gpio_pin_write(ctx->config->cs->gpio_dev,
+					ctx->config->cs->gpio_pin,
+					spi_context_cs_inactive_value(ctx));
 	}
 }
 

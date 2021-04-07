@@ -360,14 +360,17 @@ static int spi_stm32_configure(struct device *dev,
 
 	LL_SPI_DisableCRC(spi);
 
-	if (config->cs || !IS_ENABLED(CONFIG_SPI_STM32_USE_HW_SS)) {
+	if ((config->operation & SPI_OP_MODE_SLAVE) && 
+		IS_ENABLED(CONFIG_SPI_STM32_USE_HW_SS)) {
+			/* Slave mode uses CS for ISR/callback to detect end of transfer
+			   Therefore, CS should always be set - assume hardware CS
+			   is desired when in slave mode. */
+			LL_SPI_SetNSSMode(spi, LL_SPI_NSS_HARD_INPUT);
+	}
+	else if (config->cs || !IS_ENABLED(CONFIG_SPI_STM32_USE_HW_SS)) {
 		LL_SPI_SetNSSMode(spi, LL_SPI_NSS_SOFT);
 	} else {
-		if (config->operation & SPI_OP_MODE_SLAVE) {
-			LL_SPI_SetNSSMode(spi, LL_SPI_NSS_HARD_INPUT);
-		} else {
-			LL_SPI_SetNSSMode(spi, LL_SPI_NSS_HARD_OUTPUT);
-		}
+		LL_SPI_SetNSSMode(spi, LL_SPI_NSS_HARD_OUTPUT);
 	}
 
 	if (config->operation & SPI_OP_MODE_SLAVE) {
@@ -476,19 +479,13 @@ static int transceive(struct device *dev,
 	ll_func_enable_int_tx_empty(spi);
 
 #ifdef CONFIG_SPI_SLAVE
-	if(spi_context_is_slave(&data->ctx)) {
-		/* poll SS line to see if tfr is done
-		// TODO: adjust to use SS edge detection */
-		do {
-			ret = k_sem_take(&data->ctx.sync, 5);
-		} while ((ret != 0) && spi_stm32_transfer_ongoing(data));
-		k_sem_reset(&data->ctx.sync);
+	ret = spi_context_wait_for_completion(&data->ctx);
 
-		/* update return value */
-		ret = data->ctx.recv_frames;
+	if(spi_context_tx_buf_on(&data->ctx) || spi_context_rx_buf_on(&data->ctx)) {
+		/* SS line terminated trf early, complete not run in ISR so run now */
+		spi_stm32_complete(data, spi, ret);
+		LOG_INF("SS pin ended transfer early");
 	}
-	else 
-		ret = spi_context_wait_for_completion(&data->ctx);
 #else
 	ret = spi_context_wait_for_completion(&data->ctx);
 #endif /* ifdef CONFIG_SPI_SLAVE */
